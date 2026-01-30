@@ -1,0 +1,7 @@
+day1_dir: "results/week2/day1"
+out_dir: "results/week2"
+feature: "concat"
+models: ["Concat_LogReg", "Concat_SVM"]
+tag: "day4_concat"
+thr: 0.5
+vectorize: "upper"

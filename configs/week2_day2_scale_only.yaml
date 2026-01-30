@@ -1,0 +1,9 @@
+day1_dir: "results/week2/day1"
+out_dir: "results/week2"
+
+feature: "scale"
+models: ["Scale_LogReg", "Scale_SVM"]
+tag: "day2_scale_only"
+
+thr: 0.5
+vectorize: "upper"   # scale 不用，但为了统一保留

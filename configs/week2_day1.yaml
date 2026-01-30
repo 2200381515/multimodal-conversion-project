@@ -1,0 +1,14 @@
+cohort_csv: "data/derived/cohort_build_week1/cohort_table_built.csv"
+out_dir: "results/week2/day1"
+
+# 过滤规则（Day1 固化）
+require_eligible: true
+drop_qc_excluded: true
+require_modality_mask: "111"   # 先收敛到完整三模态
+labels_allowed: [0, 1]
+
+# 切分规则
+n_splits: 5
+seed: 42
+subject_id_col: "subject_id"
+label_col: "label_convert"

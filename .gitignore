@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Virtual env
+.venv/
+venv/
+env/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Project-specific (DO NOT COMMIT)
+data/
+results/
+startup/reports/
+
+# Logs / temp
+*.log
+logs/
+tmp/
+temp/
+
+# Model artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Archives / large artifacts
+*.zip
+*.tar
+*.tar.gz

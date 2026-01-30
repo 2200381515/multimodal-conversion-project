@@ -1,0 +1,9 @@
+day1_dir: "results/week2/day1"
+out_dir: "results/week2"
+
+feature: "sc"
+models: ["SC_LogReg"]
+tag: "day3_sc_only"
+
+thr: 0.5
+vectorize: "upper"   # upper 或 flatten
