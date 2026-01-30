@@ -27,6 +27,21 @@ def build(args):
 
     labels, dts, eligible, lreason = [], [], [], []
     for _, row in df.iterrows():
+        # ✅ 优先使用数据集中已提供的 label_convert（例如来自 DATASET-DIAG2）
+        raw = row.get("label_convert", None)
+        if raw is not None and not (isinstance(raw, float) and pd.isna(raw)) and str(raw).strip() != "":
+            try:
+                y0 = int(float(raw))
+                if y0 in (0, 1):
+                    labels.append(y0)
+                    dts.append(None)  # 没有日期就先不算 delta_t
+                    eligible.append(1)
+                    lreason.append("provided_label_convert")
+                    continue
+            except Exception:
+                pass
+
+        # 否则走原来的“按日期窗打标签”逻辑
         y, dt, eg, rs = compute_label_and_time(
             row.get("t0_date", None),
             row.get("followup_end_date", None),
