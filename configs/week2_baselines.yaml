@@ -1,0 +1,133 @@
+# configs/week2_baselines.yaml
+# Week2 Day2-5: featurize -> train -> eval -> summary
+
+# ---------- Inputs (from Day1) ----------
+day1_dir: "results/week2/day1"     # ✅ run_week2.py 需要这个键
+
+# （下面这些可以先留着，即使 run_week2.py 不读也无害）
+cohort_csv: "results/week2/day1/cohort_filtered.csv"
+fold_index_csv: "results/week2/day1/fold_index.csv"
+
+# ---------- Outputs ----------
+out_dir: "results/week2"
+preds_dir: "results/week2/preds"
+features_dir: "results/week2/day2/features"
+logs_path: "results/week2/logs.txt"
+
+# ---------- CV / Reproducibility ----------
+n_splits: 5
+seed: 42
+subject_id_col: "subject_id"
+label_col: "label_convert"
+
+# ---------- What to run ----------
+# 先建议只开 Scale 的 LogReg，把全链跑通；之后再把 sc/fc/concat 打开
+run:
+  featurize: true
+  train_sklearn: true
+  train_torch: false
+  eval: true
+  export_xlsx: true
+
+# ---------- Featurize settings ----------
+featurize:
+  # 需要从 cohort_csv 的这些列读取数据
+  scale_path_col: "scale_path"
+  sc_path_col: "sc_path"
+  fc_path_col: "fc_path"
+
+  # scale 特征：你现在 Dataset 已验证是 32 维（drop DATASET-DIAG2 后）
+  scale:
+    enabled: true
+    drop_cols: ["DATASET-DIAG2"]   # 防止标签泄漏
+    fillna: 0.0
+
+  # SC/FC 特征化：默认用上三角向量化（维度 64620），比全 flatten 更适合 sklearn
+  matrix:
+    enabled: true
+    method: "upper_triangle"   # 可选: "flatten" | "upper_triangle"
+    include_diag: false        # 上三角是否包含对角线
+    symmetrize: false          # 通常不用；你的 sc/fc 已经对称
+    cast_float32: true
+
+  # concat = [scale, sc_feat, fc_feat]
+  concat:
+    enabled: true
+
+  # 如果你们要做归一化（推荐在 train fold 上算）
+  normalize:
+    # scale 按 train-fold 统计均值方差
+    scale_zscore: true
+    # sc/fc 特征向量是否 zscore（对 sklearn 有时有益）
+    matrix_zscore: true
+
+# ---------- Sklearn baselines ----------
+sklearn:
+  enabled: true
+  # 你可以先只保留一个模型跑通，再逐渐加
+  models:
+    - name: "Scale_LogReg"
+      modality: "scale"         # scale | sc | fc | concat
+      estimator: "logreg"
+      params:
+        C: 1.0
+        max_iter: 5000
+        class_weight: "balanced"
+
+    - name: "Scale_SVM"
+      modality: "scale"
+      estimator: "svm_linear"
+      params:
+        C: 1.0
+        class_weight: "balanced"
+
+    - name: "SC_LogReg"
+      modality: "sc"
+      estimator: "logreg"
+      params:
+        C: 1.0
+        max_iter: 3000
+        class_weight: "balanced"
+
+    - name: "FC_LogReg"
+      modality: "fc"
+      estimator: "logreg"
+      params:
+        C: 1.0
+        max_iter: 3000
+        class_weight: "balanced"
+
+    - name: "Concat_LogReg"
+      modality: "concat"
+      estimator: "logreg"
+      params:
+        C: 1.0
+        max_iter: 5000
+        class_weight: "balanced"
+
+# ---------- Torch baselines (optional) ----------
+torch:
+  enabled: false
+  batch_size: 16
+  epochs: 50
+  lr: 1e-3
+  weight_decay: 1e-4
+  early_stop_patience: 10
+  # 用哪种输入（如果你们 torch baseline 只吃 scale 或吃 concat 特征）
+  modality: "scale"     # scale | concat | sc | fc
+  model:
+    name: "MLP"
+    hidden_dims: [128, 64]
+    dropout: 0.2
+
+# ---------- Evaluation / Metrics ----------
+eval:
+  enabled: true
+  # 常见二分类指标
+  metrics: ["auc", "prauc", "f1", "acc", "bal_acc", "sens", "spec"]
+  # 阈值策略：0.5 / youden / best_f1
+  threshold: "youden"
+  # 输出文件名
+  out_csv: "results/week2/baseline_results.csv"
+  out_json: "results/week2/eval_summary.json"
+  out_xlsx: "results/week2/baseline_results.xlsx"

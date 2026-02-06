@@ -1,4 +1,4 @@
-cohort_csv: "data/derived/cohort_build_week1/cohort_table_built.csv"
+cohort_csv: "data/derived/week1_build_full_v1/cohort_table_built.csv"
 out_dir: "results/week2/day1"
 
 # 过滤规则（Day1 固化）

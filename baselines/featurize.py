@@ -11,8 +11,15 @@ def load_scale(path: str) -> np.ndarray:
       - npy: 1D
       - csv: 单行（带header）
       - json: {k:v}，按 key 排序取 value
+
+    注意：你当前数据的 scale.csv 里包含非数值列（如 DATASET，值可能是 "['ADNI']"），
+    以及标签列（DATASET-DIAG2）。这里会：
+      1) 列名 strip（去尾部空格）
+      2) 丢弃非数值/标签列（DATASET / DATASET-DIAG2）
+      3) 其余列强制转为数值（无法转的置 NaN -> 0）
     """
     path = str(path)
+
     if path.endswith(".npy"):
         x = np.load(path)
         return x.astype(np.float32).reshape(-1)
@@ -21,7 +28,20 @@ def load_scale(path: str) -> np.ndarray:
         df = pd.read_csv(path)
         if len(df) != 1:
             raise ValueError(f"scale csv must be single-row: {path}")
-        return df.iloc[0].to_numpy(dtype=np.float32)
+
+        # 统一列名（解决尾部空格）
+        df.columns = [c.strip() for c in df.columns]
+
+        row0 = df.iloc[0]
+
+        # 丢掉明显非数值列 + 标签列（防止泄漏）
+        drop_cols = {"DATASET", "DATASET-DIAG2"}
+        row0 = row0.drop(labels=[c for c in row0.index if c in drop_cols], errors="ignore")
+
+        # 强制转数值：无法转的 -> NaN -> 0
+        s = pd.to_numeric(row0, errors="coerce").fillna(0.0)
+
+        return s.to_numpy(dtype=np.float32)
 
     if path.endswith(".json"):
         with open(path, "r", encoding="utf-8") as f:
