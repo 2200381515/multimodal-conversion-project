@@ -1,0 +1,27 @@
+experiment:
+  name: week3_tmc_minimal
+  seed: 0
+
+data:
+  # 你后续如果用 cohort_csv/data_root 方式，就在这里填
+  data_root: "F:\\2025.12.13交大新项目\\share_to_ZYF\\share_to_ZYF\\share_to_ZYF"
+  cohort_csv: ""
+
+train:
+  epochs: 10
+  batch_size: 8
+  lr: 0.001
+  device: "cuda"
+
+model:
+  embed_dim: 128
+  hidden: 256
+  num_classes: 2
+  prior: 1.0
+  evidence_activation: "softplus"
+  dropout: 0.1
+
+loss:
+  lambda_view: 1.0
+  lambda_fused: 1.0
+  lambda_evidence: 0.001
