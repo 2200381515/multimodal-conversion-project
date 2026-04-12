@@ -4,7 +4,7 @@ import os
 import json
 import random
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,9 +21,8 @@ except Exception:
 
 from pipeline.dataset import PatientT0Dataset
 from baselines.metrics import binary_metrics
-from models.mm_transformer_baseline.multimodal_transformer import (
-    MultimodalTransformerBaseline,
-)
+from models.tmc.mm_transformer_tmc import MMTransformerTMC
+from models.tmc.evidential_losses import compute_tmc_loss
 from training.common.visualize import (
     ensure_dir,
     plot_confusion_binary,
@@ -33,16 +32,19 @@ from training.common.visualize import (
 
 
 @dataclass
-class TrainConfig:
+class TrainConfigTMC:
+    # 数据
     cohort_csv: str
     fold_index_csv: str
     out_dir: str
 
+    # 训练
     batch_size: int = 8
     epochs: int = 30
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
+    lr: float = 0.001
+    weight_decay: float = 0.0001
 
+    # baseline backbone 参数
     embed_dim: int = 128
     num_heads: int = 4
     dropout: float = 0.1
@@ -51,6 +53,21 @@ class TrainConfig:
     matrix_pool_width: int = 32
     classifier_hidden: int = 128
 
+    # TMC head 参数
+    evidence_hidden_dim: int = 128
+    evidence_dropout: float = 0.1
+    use_fused_feature_view: bool = False
+
+    # loss
+    lambda_view: float = 0.3
+    lambda_evidence: float = 0.0001
+
+    # pos weight 策略
+    pos_weight_mode: str = "dynamic_cap"   # fixed / dynamic / dynamic_cap
+    pos_weight: float = 6.0
+    pos_weight_cap: float = 6.0
+
+    # 其他
     val_ratio: float = 0.2
     seed: int = 42
     num_workers: int = 0
@@ -67,12 +84,62 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def load_config_from_yaml(yaml_path: str) -> TrainConfig:
+def load_config_from_yaml(yaml_path: str) -> TrainConfigTMC:
+    """
+    兼容两种 yaml 风格：
+    1) 旧 baseline 的扁平风格
+    2) 你现在 transformer_tmc.yaml 的 data/model/train 嵌套风格
+    """
     if yaml is None:
         raise RuntimeError("未安装 pyyaml，请先执行: pip install pyyaml")
+
     with open(yaml_path, "r", encoding="utf-8") as f:
         cfg_dict = yaml.safe_load(f)
-    return TrainConfig(**cfg_dict)
+
+    # 嵌套风格
+    if "data" in cfg_dict and "train" in cfg_dict and "model" in cfg_dict:
+        data_cfg = cfg_dict.get("data", {})
+        model_cfg = cfg_dict.get("model", {})
+        train_cfg = cfg_dict.get("train", {})
+        backbone_cfg = model_cfg.get("backbone_kwargs", {})
+
+        return TrainConfigTMC(
+            cohort_csv=data_cfg["cohort_csv"],
+            fold_index_csv=data_cfg["fold_index_csv"],
+            out_dir=train_cfg["out_dir"],
+
+            batch_size=int(train_cfg.get("batch_size", 8)),
+            epochs=int(train_cfg.get("epochs", 30)),
+            lr=float(train_cfg.get("lr", 0.001)),
+            weight_decay=float(train_cfg.get("weight_decay", 0.0001)),
+
+            embed_dim=int(backbone_cfg.get("embed_dim", 128)),
+            num_heads=int(backbone_cfg.get("num_heads", 4)),
+            dropout=float(backbone_cfg.get("dropout", 0.1)),
+            scale_tokens=int(backbone_cfg.get("scale_tokens", 1)),
+            matrix_tokens=int(backbone_cfg.get("matrix_tokens", 8)),
+            matrix_pool_width=int(backbone_cfg.get("matrix_pool_width", 32)),
+            classifier_hidden=int(backbone_cfg.get("classifier_hidden", 128)),
+
+            evidence_hidden_dim=int(model_cfg.get("evidence_hidden_dim", 128)),
+            evidence_dropout=float(model_cfg.get("evidence_dropout", 0.1)),
+            use_fused_feature_view=bool(model_cfg.get("use_fused_feature_view", False)),
+
+            lambda_view=float(train_cfg.get("lambda_view", 0.3)),
+            lambda_evidence=float(train_cfg.get("lambda_evidence", 0.0001)),
+
+            pos_weight_mode=str(train_cfg.get("pos_weight_mode", "dynamic_cap")),
+            pos_weight=float(train_cfg.get("pos_weight", 6.0)),
+            pos_weight_cap=float(train_cfg.get("pos_weight_cap", 6.0)),
+
+            val_ratio=float(train_cfg.get("val_ratio", 0.2)),
+            seed=int(train_cfg.get("seed", 42)),
+            num_workers=int(train_cfg.get("num_workers", 0)),
+            device=str(train_cfg.get("device", "cuda" if torch.cuda.is_available() else "cpu")),
+        )
+
+    # 扁平风格
+    return TrainConfigTMC(**cfg_dict)
 
 
 def load_fold_index_map(fold_index_csv: str) -> Dict[str, int]:
@@ -88,7 +155,7 @@ def load_fold_index_map(fold_index_csv: str) -> Dict[str, int]:
     return dict(zip(df["subject_id"].astype(str), df["test_fold_id"].astype(int)))
 
 
-def build_dataset_and_df(cfg: TrainConfig) -> Tuple[PatientT0Dataset, pd.DataFrame]:
+def build_dataset_and_df(cfg: TrainConfigTMC) -> Tuple[PatientT0Dataset, pd.DataFrame]:
     ds = PatientT0Dataset(
         cohort_csv=cfg.cohort_csv,
         require_eligible=False,   # cohort_filtered.csv 通常已过滤过
@@ -173,16 +240,24 @@ def infer_scale_dim(dataset: PatientT0Dataset) -> int:
     return int(x_scale.numel())
 
 
-def build_model(cfg: TrainConfig, scale_dim: int) -> MultimodalTransformerBaseline:
-    model = MultimodalTransformerBaseline(
-        scale_dim=scale_dim,
-        embed_dim=cfg.embed_dim,
-        num_heads=cfg.num_heads,
-        dropout=cfg.dropout,
-        scale_tokens=cfg.scale_tokens,
-        matrix_tokens=cfg.matrix_tokens,
-        matrix_pool_width=cfg.matrix_pool_width,
-        classifier_hidden=cfg.classifier_hidden,
+def build_model(cfg: TrainConfigTMC, scale_dim: int) -> MMTransformerTMC:
+    backbone_kwargs = {
+        "scale_dim": scale_dim,
+        "embed_dim": cfg.embed_dim,
+        "num_heads": cfg.num_heads,
+        "dropout": cfg.dropout,
+        "scale_tokens": cfg.scale_tokens,
+        "matrix_tokens": cfg.matrix_tokens,
+        "matrix_pool_width": cfg.matrix_pool_width,
+        "classifier_hidden": cfg.classifier_hidden,
+    }
+
+    model = MMTransformerTMC(
+        backbone_kwargs=backbone_kwargs,
+        n_classes=2,
+        evidence_hidden_dim=cfg.evidence_hidden_dim,
+        evidence_dropout=cfg.evidence_dropout,
+        use_fused_feature_view=cfg.use_fused_feature_view,
     )
     return model
 
@@ -197,19 +272,80 @@ def move_batch_to_device(batch: Dict, device: str) -> Dict:
     return out
 
 
+def _extract_subject_ids_from_meta(metas, n: int) -> List[str]:
+    """
+    兼容 DataLoader 默认 collate 后 meta 的几种形式
+    """
+    if isinstance(metas, dict) and "subject_id" in metas:
+        vals = metas["subject_id"]
+        if isinstance(vals, list):
+            return [str(v) for v in vals]
+        return [str(v) for v in vals]
+    elif isinstance(metas, list):
+        out = []
+        for m in metas:
+            if isinstance(m, dict) and "subject_id" in m:
+                out.append(str(m["subject_id"]))
+            else:
+                out.append("unknown")
+        return out
+    else:
+        return ["unknown"] * n
+
+
+def find_best_threshold_by_f1(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    在验证集上搜索使 F1 最大的阈值
+    """
+    if len(y_true) == 0:
+        return 0.5, 0.0
+
+    candidate_thrs = np.unique(np.round(y_prob, 4))
+    candidate_thrs = np.concatenate(
+        [np.array([0.1, 0.2, 0.3, 0.4, 0.5]), candidate_thrs]
+    )
+    candidate_thrs = np.unique(candidate_thrs)
+
+    best_thr = 0.5
+    best_f1 = -1.0
+
+    for thr in candidate_thrs:
+        m = binary_metrics(y_true, y_prob, thr=float(thr))
+        f1 = float(m["F1"])
+        if f1 > best_f1:
+            best_f1 = f1
+            best_thr = float(thr)
+
+    return best_thr, best_f1
+
+
 @torch.no_grad()
-def evaluate_epoch(
+def evaluate_epoch_tmc(
     model: nn.Module,
     loader: DataLoader,
     device: str,
-    criterion: nn.Module,
+    pos_weight_value: float,
+    lambda_view: float,
+    lambda_evidence: float,
+    thr: Optional[float] = None,
 ) -> Dict:
     model.eval()
 
-    losses = []
+    total_losses = []
+    fused_bce_losses = []
+    view_bce_losses = []
+    e_reg_losses = []
+
     y_true_all = []
     y_prob_all = []
+    u_all = []
+    conflict_all = []
     meta_subjects = []
+
+    extra_cols = {}
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -220,36 +356,81 @@ def evaluate_epoch(
             x_fc=batch["x_fc"].float(),
             modality_mask=batch["modality_mask"].float(),
         )
-        logits = out["logits"]
-        y = batch["y"].float()
 
-        loss = criterion(logits, y)
-        losses.append(float(loss.item()))
+        y = batch["y"].long()
 
-        y_prob = torch.sigmoid(logits).detach().cpu().numpy()
-        y_true = y.detach().cpu().numpy()
+        loss_out = compute_tmc_loss(
+            fused_prob=out.probs,
+            view_probs=out.view_probs,
+            view_evidences=out.view_evidences,
+            target=y,
+            pos_weight=pos_weight_value,
+            lambda_view=lambda_view,
+            lambda_evidence=lambda_evidence,
+        )
+
+        total_losses.append(float(loss_out.total.item()))
+        fused_bce_losses.append(float(loss_out.fused_bce.item()))
+        view_bce_losses.append(float(loss_out.view_bce.item()))
+        e_reg_losses.append(float(loss_out.evidence_reg.item()))
+
+        y_prob = out.probs.detach().cpu().numpy()
+        y_true = y.detach().cpu().numpy().astype(int)
 
         y_prob_all.extend(y_prob.tolist())
-        y_true_all.extend(y_true.astype(int).tolist())
+        y_true_all.extend(y_true.tolist())
+
+        fused_u = out.fused_uncertainty
+        if fused_u.ndim == 2:
+            fused_u = fused_u.squeeze(-1)
+        u_all.extend(fused_u.detach().cpu().numpy().tolist())
+
+        conflict_all.extend(out.conflict.detach().cpu().numpy().tolist())
 
         metas = batch["meta"]
-        if isinstance(metas, dict) and "subject_id" in metas:
-            meta_subjects.extend([str(s) for s in metas["subject_id"]])
-        else:
-            meta_subjects.extend(["unknown"] * len(y_true))
+        meta_subjects.extend(_extract_subject_ids_from_meta(metas, len(y_true)))
+
+        # 保存 view prob / uncertainty，便于后面分析
+        for name, vp in out.view_probs.items():
+            col = f"view_prob_{name}"
+            vals = vp[:, 1].detach().cpu().numpy().tolist()
+            extra_cols.setdefault(col, []).extend(vals)
+
+        for name, vu in out.view_uncertainties.items():
+            col = f"view_u_{name}"
+            arr = vu
+            if arr.ndim == 2:
+                arr = arr.squeeze(-1)
+            vals = arr.detach().cpu().numpy().tolist()
+            extra_cols.setdefault(col, []).extend(vals)
 
     y_true_arr = np.asarray(y_true_all).astype(int)
     y_prob_arr = np.asarray(y_prob_all).astype(float)
-    y_pred_arr = (y_prob_arr >= 0.5).astype(int)
 
-    m = binary_metrics(y_true_arr, y_prob_arr, thr=0.5)
+    if thr is None:
+        best_thr, best_f1 = find_best_threshold_by_f1(y_true_arr, y_prob_arr)
+        used_thr = best_thr
+    else:
+        used_thr = float(thr)
+        best_f1 = float(binary_metrics(y_true_arr, y_prob_arr, thr=used_thr)["F1"])
+
+    y_pred_arr = (y_prob_arr >= used_thr).astype(int)
+
+    m = binary_metrics(y_true_arr, y_prob_arr, thr=used_thr)
     if len(np.unique(y_true_arr)) > 1:
         pr_auc = float(average_precision_score(y_true_arr, y_prob_arr))
     else:
         pr_auc = float("nan")
 
     m["PR_AUC"] = pr_auc
-    m["loss"] = float(np.mean(losses)) if losses else float("nan")
+    m["loss_total"] = float(np.mean(total_losses)) if total_losses else float("nan")
+    m["loss_fused_bce"] = float(np.mean(fused_bce_losses)) if fused_bce_losses else float("nan")
+    m["loss_view_bce"] = float(np.mean(view_bce_losses)) if view_bce_losses else float("nan")
+    m["loss_e_reg"] = float(np.mean(e_reg_losses)) if e_reg_losses else float("nan")
+    m["mean_u"] = float(np.mean(u_all)) if len(u_all) > 0 else float("nan")
+    m["mean_conflict"] = float(np.mean(conflict_all)) if len(conflict_all) > 0 else float("nan")
+    m["thr"] = float(used_thr)
+    m["best_f1_from_search"] = float(best_f1)
 
     pred_df = pd.DataFrame(
         {
@@ -257,8 +438,13 @@ def evaluate_epoch(
             "y_true": y_true_arr,
             "y_prob": y_prob_arr,
             "y_pred": y_pred_arr,
+            "uncertainty": np.asarray(u_all, dtype=float),
+            "conflict": np.asarray(conflict_all, dtype=float),
         }
     )
+
+    for col_name, vals in extra_cols.items():
+        pred_df[col_name] = vals
 
     return {
         "metrics": m,
@@ -266,15 +452,21 @@ def evaluate_epoch(
     }
 
 
-def train_one_epoch(
+def train_one_epoch_tmc(
     model: nn.Module,
     loader: DataLoader,
     device: str,
     optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-) -> float:
+    pos_weight_value: float,
+    lambda_view: float,
+    lambda_evidence: float,
+) -> Dict[str, float]:
     model.train()
-    losses = []
+
+    total_losses = []
+    fused_bce_losses = []
+    view_bce_losses = []
+    e_reg_losses = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -287,16 +479,32 @@ def train_one_epoch(
             x_fc=batch["x_fc"].float(),
             modality_mask=batch["modality_mask"].float(),
         )
-        logits = out["logits"]
-        y = batch["y"].float()
+        y = batch["y"].long()
 
-        loss = criterion(logits, y)
-        loss.backward()
+        loss_out = compute_tmc_loss(
+            fused_prob=out.probs,
+            view_probs=out.view_probs,
+            view_evidences=out.view_evidences,
+            target=y,
+            pos_weight=pos_weight_value,
+            lambda_view=lambda_view,
+            lambda_evidence=lambda_evidence,
+        )
+
+        loss_out.total.backward()
         optimizer.step()
 
-        losses.append(float(loss.item()))
+        total_losses.append(float(loss_out.total.item()))
+        fused_bce_losses.append(float(loss_out.fused_bce.item()))
+        view_bce_losses.append(float(loss_out.view_bce.item()))
+        e_reg_losses.append(float(loss_out.evidence_reg.item()))
 
-    return float(np.mean(losses)) if losses else float("nan")
+    return {
+        "train_loss": float(np.mean(total_losses)) if total_losses else float("nan"),
+        "train_fused_bce": float(np.mean(fused_bce_losses)) if fused_bce_losses else float("nan"),
+        "train_view_bce": float(np.mean(view_bce_losses)) if view_bce_losses else float("nan"),
+        "train_e_reg": float(np.mean(e_reg_losses)) if e_reg_losses else float("nan"),
+    }
 
 
 def save_json(obj: Dict, path: str):
@@ -309,7 +517,11 @@ def summarize_metrics_across_folds(fold_metrics: pd.DataFrame) -> pd.DataFrame:
         "AUC", "PR_AUC", "F1", "ACC", "SEN", "SPE",
         "TP", "FP", "TN", "FN",
         "best_val_auc",
-        "test_loss",
+        "test_loss_total",
+        "test_loss_fused_bce",
+        "test_mean_u",
+        "test_mean_conflict",
+        "used_thr",
     ]
     rows = []
     for c in metric_cols:
@@ -328,8 +540,35 @@ def summarize_metrics_across_folds(fold_metrics: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def resolve_pos_weight(
+    cfg: TrainConfigTMC,
+    y_train: np.ndarray,
+) -> Tuple[float, float]:
+    """
+    返回:
+    - used_pos_weight
+    - dynamic_pos_weight
+    """
+    n_pos = int((y_train == 1).sum())
+    n_neg = int((y_train == 0).sum())
+    dynamic_pos_weight = float(n_neg / max(n_pos, 1))
+
+    mode = cfg.pos_weight_mode.lower()
+
+    if mode == "fixed":
+        used = float(cfg.pos_weight)
+    elif mode == "dynamic":
+        used = dynamic_pos_weight
+    elif mode == "dynamic_cap":
+        used = min(dynamic_pos_weight, float(cfg.pos_weight_cap))
+    else:
+        raise ValueError(f"未知 pos_weight_mode={cfg.pos_weight_mode}")
+
+    return float(used), float(dynamic_pos_weight)
+
+
 def train_one_fold(
-    cfg: TrainConfig,
+    cfg: TrainConfigTMC,
     dataset: PatientT0Dataset,
     df: pd.DataFrame,
     fold_id: int,
@@ -379,12 +618,8 @@ def train_one_fold(
     model = build_model(cfg, scale_dim).to(cfg.device)
 
     y_train = labels_all[train_indices]
-    n_pos = int((y_train == 1).sum())
-    n_neg = int((y_train == 0).sum())
-    pos_weight_value = float(n_neg / max(n_pos, 1))
-    pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=cfg.device)
+    used_pos_weight, dynamic_pos_weight = resolve_pos_weight(cfg, y_train)
 
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg.lr,
@@ -394,35 +629,47 @@ def train_one_fold(
     history_rows = []
     best_val_auc = -1.0
     best_epoch = -1
+    best_thr = 0.5
     best_state_dict = None
 
     for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(
+        train_stats = train_one_epoch_tmc(
             model=model,
             loader=train_loader,
             device=cfg.device,
             optimizer=optimizer,
-            criterion=criterion,
+            pos_weight_value=used_pos_weight,
+            lambda_view=cfg.lambda_view,
+            lambda_evidence=cfg.lambda_evidence,
         )
 
-        val_res = evaluate_epoch(
+        val_res = evaluate_epoch_tmc(
             model=model,
             loader=val_loader,
             device=cfg.device,
-            criterion=criterion,
+            pos_weight_value=used_pos_weight,
+            lambda_view=cfg.lambda_view,
+            lambda_evidence=cfg.lambda_evidence,
+            thr=None,   # 在 val 上自动找 best threshold
         )
         val_metrics = val_res["metrics"]
 
         row = {
             "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_metrics["loss"],
+            **train_stats,
+            "val_loss_total": val_metrics["loss_total"],
+            "val_loss_fused_bce": val_metrics["loss_fused_bce"],
+            "val_loss_view_bce": val_metrics["loss_view_bce"],
+            "val_loss_e_reg": val_metrics["loss_e_reg"],
             "val_auc": val_metrics["AUC"],
             "val_pr_auc": val_metrics["PR_AUC"],
             "val_f1": val_metrics["F1"],
             "val_acc": val_metrics["ACC"],
             "val_sen": val_metrics["SEN"],
             "val_spe": val_metrics["SPE"],
+            "val_mean_u": val_metrics["mean_u"],
+            "val_mean_conflict": val_metrics["mean_conflict"],
+            "val_thr": val_metrics["thr"],
         }
         history_rows.append(row)
 
@@ -433,6 +680,7 @@ def train_one_fold(
         if current_val_auc > best_val_auc:
             best_val_auc = float(current_val_auc)
             best_epoch = epoch
+            best_thr = float(val_metrics["thr"])
             best_state_dict = {
                 k: v.detach().cpu().clone()
                 for k, v in model.state_dict().items()
@@ -440,9 +688,11 @@ def train_one_fold(
 
         print(
             f"[fold {fold_id}] epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} | "
+            f"train_loss={train_stats['train_loss']:.4f} | "
             f"val_auc={val_metrics['AUC']:.4f} | "
-            f"val_f1={val_metrics['F1']:.4f}"
+            f"val_f1={val_metrics['F1']:.4f} | "
+            f"val_thr={val_metrics['thr']:.4f} | "
+            f"val_mean_u={val_metrics['mean_u']:.4f}"
         )
 
     if best_state_dict is None:
@@ -455,12 +705,15 @@ def train_one_fold(
     # 加载最佳模型
     model.load_state_dict(best_state_dict)
 
-    # 测试集评估
-    test_res = evaluate_epoch(
+    # 测试集评估：使用验证集选出来的 best_thr
+    test_res = evaluate_epoch_tmc(
         model=model,
         loader=test_loader,
         device=cfg.device,
-        criterion=criterion,
+        pos_weight_value=used_pos_weight,
+        lambda_view=cfg.lambda_view,
+        lambda_evidence=cfg.lambda_evidence,
+        thr=best_thr,
     )
     test_metrics = test_res["metrics"]
     pred_df = test_res["pred_df"]
@@ -499,6 +752,9 @@ def train_one_fold(
         "scale_dim": scale_dim,
         "best_epoch": best_epoch,
         "best_val_auc": best_val_auc,
+        "best_thr": best_thr,
+        "used_pos_weight": used_pos_weight,
+        "dynamic_pos_weight": dynamic_pos_weight,
     }
     torch.save(ckpt, os.path.join(fold_out_dir, "model.pt"))
 
@@ -506,6 +762,9 @@ def train_one_fold(
     metrics_out["fold_id"] = fold_id
     metrics_out["best_epoch"] = int(best_epoch)
     metrics_out["best_val_auc"] = float(best_val_auc)
+    metrics_out["best_thr"] = float(best_thr)
+    metrics_out["used_pos_weight"] = float(used_pos_weight)
+    metrics_out["dynamic_pos_weight"] = float(dynamic_pos_weight)
     save_json(metrics_out, os.path.join(fold_out_dir, "metrics.json"))
 
     print(
@@ -514,7 +773,8 @@ def train_one_fold(
         f"PR_AUC={test_metrics['PR_AUC']:.4f} | "
         f"F1={test_metrics['F1']:.4f} | "
         f"SEN={test_metrics['SEN']:.4f} | "
-        f"SPE={test_metrics['SPE']:.4f}"
+        f"SPE={test_metrics['SPE']:.4f} | "
+        f"thr={best_thr:.4f}"
     )
 
     return {
@@ -529,17 +789,24 @@ def train_one_fold(
         "FP": test_metrics["FP"],
         "TN": test_metrics["TN"],
         "FN": test_metrics["FN"],
-        "test_loss": test_metrics["loss"],
+        "test_loss_total": test_metrics["loss_total"],
+        "test_loss_fused_bce": test_metrics["loss_fused_bce"],
+        "test_loss_view_bce": test_metrics["loss_view_bce"],
+        "test_loss_e_reg": test_metrics["loss_e_reg"],
+        "test_mean_u": test_metrics["mean_u"],
+        "test_mean_conflict": test_metrics["mean_conflict"],
         "best_epoch": best_epoch,
         "best_val_auc": best_val_auc,
+        "used_thr": best_thr,
         "n_train": len(train_indices),
         "n_val": len(val_indices),
         "n_test": len(test_indices),
-        "pos_weight": pos_weight_value,
+        "used_pos_weight": used_pos_weight,
+        "dynamic_pos_weight": dynamic_pos_weight,
     }
 
 
-def run_train(cfg: TrainConfig):
+def run_train(cfg: TrainConfigTMC):
     ensure_dir(cfg.out_dir)
     set_seed(cfg.seed)
 
@@ -589,7 +856,7 @@ def main():
         "--yaml",
         type=str,
         required=True,
-        help="例如: configs/mm_transformer_baseline/transformer_baseline.yaml",
+        help="例如: configs/mm_transformer_tmc/transformer_tmc.yaml",
     )
     args = ap.parse_args()
 

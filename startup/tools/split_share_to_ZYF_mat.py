@@ -5,8 +5,8 @@ import numpy as np
 import pandas as pd
 import scipy.io as sio
 
-MAT_PATH = r"F:\2025.12.13交大新项目\share_to_ZYF\share_to_ZYF\combined_aligned.mat"
-OUT_ROOT = Path(r"F:\2025.12.13交大新项目\share_to_ZYF\derived_per_subject")  # 你也可以改成别的目录
+MAT_PATH = r"F:\2025.12.13交大新项目\share_to_ZYF_v2\share_to_ZYF_v2\combined_aligned_v2.mat"
+OUT_ROOT = Path(r"F:\2025.12.13交大新项目\share_to_ZYF_v2\derived_per_subject")  # 你也可以改成别的目录
 OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 def _to_str(x) -> str:
@@ -113,7 +113,7 @@ def main():
         })
 
     # 同时写一份 full cohort_table（不是必须，但很实用）
-    out_full = Path(r"F:\multimodal-conversion-project\startup\cohort_table\cohort_table_full_from_mat.csv")
+    out_full = Path(r"F:\multimodal-conversion-project\startup\cohort_table\cohort_table_full_from_mat_v2.csv")
     out_full.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(out_full, index=False, encoding="utf-8-sig")
     print(f"[DONE] per-subject files written to: {OUT_ROOT}")

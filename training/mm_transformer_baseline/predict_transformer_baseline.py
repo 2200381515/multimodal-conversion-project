@@ -119,7 +119,7 @@ def predict_on_dataset(
         else:
             subject_ids.extend(["unknown"] * len(y_true))
 
-    y_true_arr = pd.asarray(y_true_all).astype(int)
+    y_true_arr = np.asarray(y_true_all).astype(int)
     y_prob_arr = np.asarray(y_prob_all).astype(float)
     y_pred_arr = (y_prob_arr >= 0.5).astype(int)
 

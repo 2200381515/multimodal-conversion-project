@@ -35,21 +35,21 @@ from training.common.visualize import (
 @dataclass
 class TrainConfig:
     cohort_csv: str
-    fold_index_csv: str
+    split_csv: str
     out_dir: str
 
     batch_size: int = 8
-    epochs: int = 30
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
+    epochs: int = 25
+    lr: float = 0.0003
+    weight_decay: float = 0.0005
 
-    embed_dim: int = 128
-    num_heads: int = 4
-    dropout: float = 0.1
+    embed_dim: int = 64
+    num_heads: int = 2
+    dropout: float = 0.5
     scale_tokens: int = 1
     matrix_tokens: int = 8
     matrix_pool_width: int = 32
-    classifier_hidden: int = 128
+    classifier_hidden: int = 64
 
     val_ratio: float = 0.2
     seed: int = 42
@@ -62,7 +62,6 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # 为了结果更稳定
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -75,24 +74,36 @@ def load_config_from_yaml(yaml_path: str) -> TrainConfig:
     return TrainConfig(**cfg_dict)
 
 
-def load_fold_index_map(fold_index_csv: str) -> Dict[str, int]:
+def load_split_df(split_csv: str) -> pd.DataFrame:
     """
-    fold_index.csv 由 baselines/day1_prepare.py 生成，
-    包含: subject_id, label_convert, test_fold_id
+    split_csv 需要至少包含:
+    - subject_id
+    - split  (取值: trainval / test)
     """
-    df = pd.read_csv(fold_index_csv)
-    if "subject_id" not in df.columns or "test_fold_id" not in df.columns:
+    df = pd.read_csv(split_csv)
+    required = {"subject_id", "split"}
+    if not required.issubset(set(df.columns)):
         raise ValueError(
-            f"fold_index_csv 缺少必须列: subject_id/test_fold_id, got columns={list(df.columns)}"
+            f"split_csv 缺少必须列: {sorted(required)}, got columns={list(df.columns)}"
         )
-    return dict(zip(df["subject_id"].astype(str), df["test_fold_id"].astype(int)))
+
+    df = df.copy()
+    df["subject_id"] = df["subject_id"].astype(str)
+    df["split"] = df["split"].astype(str)
+
+    valid_splits = {"trainval", "test"}
+    bad = sorted(set(df["split"].unique()) - valid_splits)
+    if bad:
+        raise ValueError(f"split_csv 存在非法 split 值: {bad}, 只允许 {sorted(valid_splits)}")
+
+    return df
 
 
 def build_dataset_and_df(cfg: TrainConfig) -> Tuple[PatientT0Dataset, pd.DataFrame]:
     ds = PatientT0Dataset(
         cohort_csv=cfg.cohort_csv,
-        require_eligible=False,   # cohort_filtered.csv 通常已过滤过
-        drop_qc_excluded=False,   # 同上
+        require_eligible=False,
+        drop_qc_excluded=False,
         fill_missing=True,
         sc_norm="zscore_global",
         fc_norm="zscore_global",
@@ -100,17 +111,24 @@ def build_dataset_and_df(cfg: TrainConfig) -> Tuple[PatientT0Dataset, pd.DataFra
         drop_scale_cols=["DATASET-DIAG2"],
     )
     df = ds.df.copy().reset_index(drop=True)
+    df["subject_id"] = df["subject_id"].astype(str)
+    df["label_convert"] = df["label_convert"].astype(int)
     return ds, df
 
 
-def add_fold_column(df: pd.DataFrame, fold_map: Dict[str, int]) -> pd.DataFrame:
+def add_split_column(df: pd.DataFrame, split_df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["subject_id"] = df["subject_id"].astype(str)
-    df["test_fold_id"] = df["subject_id"].map(fold_map)
-    if df["test_fold_id"].isna().any():
-        miss = df.loc[df["test_fold_id"].isna(), "subject_id"].tolist()[:10]
-        raise RuntimeError(f"有样本在 fold_index.csv 中找不到 test_fold_id，例如: {miss}")
-    df["test_fold_id"] = df["test_fold_id"].astype(int)
+
+    split_df = split_df[["subject_id", "split"]].drop_duplicates().copy()
+    split_df["subject_id"] = split_df["subject_id"].astype(str)
+
+    df = df.merge(split_df, on="subject_id", how="left")
+
+    if df["split"].isna().any():
+        miss = df.loc[df["split"].isna(), "subject_id"].tolist()[:10]
+        raise RuntimeError(f"有样本在 split_csv 中找不到 split，例如: {miss}")
+
     return df
 
 
@@ -121,7 +139,7 @@ def split_train_val_indices(
     seed: int,
 ) -> Tuple[List[int], List[int]]:
     """
-    在 train fold 内再切一个 val。
+    在 trainval 集内再切一个 val。
     如果标签太极端导致 stratify 失败，则退化为随机切分。
     """
     if len(train_indices) < 2:
@@ -198,7 +216,7 @@ def move_batch_to_device(batch: Dict, device: str) -> Dict:
 
 
 @torch.no_grad()
-def evaluate_epoch(
+def collect_predictions(
     model: nn.Module,
     loader: DataLoader,
     device: str,
@@ -226,6 +244,7 @@ def evaluate_epoch(
         loss = criterion(logits, y)
         losses.append(float(loss.item()))
 
+
         y_prob = torch.sigmoid(logits).detach().cpu().numpy()
         y_true = y.detach().cpu().numpy()
 
@@ -240,23 +259,42 @@ def evaluate_epoch(
 
     y_true_arr = np.asarray(y_true_all).astype(int)
     y_prob_arr = np.asarray(y_prob_all).astype(float)
-    y_pred_arr = (y_prob_arr >= 0.5).astype(int)
+    loss_mean = float(np.mean(losses)) if losses else float("nan")
 
-    m = binary_metrics(y_true_arr, y_prob_arr, thr=0.5)
+    return {
+        "y_true": y_true_arr,
+        "y_prob": y_prob_arr,
+        "subject_id": meta_subjects,
+        "loss": loss_mean,
+    }
+
+
+def build_eval_result(
+    y_true_arr: np.ndarray,
+    y_prob_arr: np.ndarray,
+    subject_ids: List[str],
+    loss_value: float,
+    thr: float,
+) -> Dict:
+    y_pred_arr = (y_prob_arr >= thr).astype(int)
+
+    m = binary_metrics(y_true_arr, y_prob_arr, thr=thr)
     if len(np.unique(y_true_arr)) > 1:
         pr_auc = float(average_precision_score(y_true_arr, y_prob_arr))
     else:
         pr_auc = float("nan")
 
     m["PR_AUC"] = pr_auc
-    m["loss"] = float(np.mean(losses)) if losses else float("nan")
+    m["loss"] = float(loss_value)
+    m["thr"] = float(thr)
 
     pred_df = pd.DataFrame(
         {
-            "subject_id": meta_subjects,
+            "subject_id": subject_ids,
             "y_true": y_true_arr,
             "y_prob": y_prob_arr,
             "y_pred": y_pred_arr,
+            "used_thr": float(thr),
         }
     )
 
@@ -264,6 +302,62 @@ def evaluate_epoch(
         "metrics": m,
         "pred_df": pred_df,
     }
+
+
+@torch.no_grad()
+def evaluate_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: str,
+    criterion: nn.Module,
+    thr: float = 0.5,
+) -> Dict:
+    collected = collect_predictions(
+        model=model,
+        loader=loader,
+        device=device,
+        criterion=criterion,
+    )
+    return build_eval_result(
+        y_true_arr=collected["y_true"],
+        y_prob_arr=collected["y_prob"],
+        subject_ids=collected["subject_id"],
+        loss_value=collected["loss"],
+        thr=thr,
+    )
+
+
+def choose_best_threshold(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+) -> float:
+    """
+    更稳的阈值选择：
+    直接看验证集负类分数分布，
+    用负类高分位数来定阈值，优先控制假阳性。
+    """
+    if len(y_true) == 0 or len(np.unique(y_true)) < 2:
+        return 0.5
+
+    neg_probs = y_prob[y_true == 0]
+    pos_probs = y_prob[y_true == 1]
+
+    if len(neg_probs) == 0:
+        return 0.5
+
+    # 主阈值：负类 85% 分位点
+    thr = float(np.quantile(neg_probs, 0.875))
+
+    # 防止阈值太极端
+    thr = max(0.30, min(0.80, thr))
+
+    print(
+        f"[THR SEARCH] thr={thr:.4f} | "
+        f"neg_q875={np.quantile(neg_probs, 0.875):.4f} | "
+        f"neg_mean={neg_probs.mean():.4f} | "
+        f"pos_mean={pos_probs.mean():.4f}"
+    )
+    return thr
 
 
 def train_one_epoch(
@@ -304,55 +398,52 @@ def save_json(obj: Dict, path: str):
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
-def summarize_metrics_across_folds(fold_metrics: pd.DataFrame) -> pd.DataFrame:
-    metric_cols = [
-        "AUC", "PR_AUC", "F1", "ACC", "SEN", "SPE",
-        "TP", "FP", "TN", "FN",
-        "best_val_auc",
-        "test_loss",
-    ]
-    rows = []
-    for c in metric_cols:
-        if c not in fold_metrics.columns:
-            continue
-        vals = pd.to_numeric(fold_metrics[c], errors="coerce")
-        rows.append(
-            {
-                "metric": c,
-                "mean": float(vals.mean()),
-                "std": float(vals.std()),
-                "min": float(vals.min()),
-                "max": float(vals.max()),
-            }
-        )
-    return pd.DataFrame(rows)
+def run_train(cfg: TrainConfig):
+    ensure_dir(cfg.out_dir)
+    set_seed(cfg.seed)
 
+    save_json(asdict(cfg), os.path.join(cfg.out_dir, "config_snapshot.json"))
 
-def train_one_fold(
-    cfg: TrainConfig,
-    dataset: PatientT0Dataset,
-    df: pd.DataFrame,
-    fold_id: int,
-    scale_dim: int,
-) -> Dict:
-    fold_out_dir = os.path.join(cfg.out_dir, f"fold_{fold_id}")
-    fig_dir = os.path.join(fold_out_dir, "figures")
-    ensure_dir(fold_out_dir)
-    ensure_dir(fig_dir)
+    dataset, df = build_dataset_and_df(cfg)
+    split_df = load_split_df(cfg.split_csv)
+    df = add_split_column(df, split_df)
 
-    test_indices = df.index[df["test_fold_id"] == fold_id].tolist()
-    trainval_indices = df.index[df["test_fold_id"] != fold_id].tolist()
+    scale_dim = infer_scale_dim(dataset)
+
+    print(f"[INFO] dataset size = {len(dataset)}")
+    print(f"[INFO] scale_dim = {scale_dim}")
+    print(f"[INFO] device = {cfg.device}")
+    print("[INFO] split counts:")
+    print(df["split"].value_counts())
+    print("[INFO] test label counts:")
+    print(df.loc[df["split"] == "test", "label_convert"].value_counts())
+
+    test_indices = df.index[df["split"] == "test"].tolist()
+    trainval_indices = df.index[df["split"] == "trainval"].tolist()
+
+    if len(test_indices) == 0:
+        raise RuntimeError("test 集为空，请检查 split_csv。")
+    if len(trainval_indices) == 0:
+        raise RuntimeError("trainval 集为空，请检查 split_csv。")
 
     labels_all = df["label_convert"].astype(int).to_numpy()
     train_indices, val_indices = split_train_val_indices(
         train_indices=trainval_indices,
         labels=labels_all,
         val_ratio=cfg.val_ratio,
-        seed=cfg.seed + fold_id,
+        seed=cfg.seed,
     )
 
     if len(val_indices) == 0:
-        raise RuntimeError(f"fold {fold_id} 的 val 集为空，请检查数据量或 val_ratio。")
+        raise RuntimeError("val 集为空，请检查 trainval 数量或 val_ratio。")
+
+    print(f"[INFO] n_train={len(train_indices)}, n_val={len(val_indices)}, n_test={len(test_indices)}")
+    print("[INFO] train label counts:")
+    print(pd.Series(labels_all[train_indices]).value_counts())
+    print("[INFO] val label counts:")
+    print(pd.Series(labels_all[val_indices]).value_counts())
+    print("[INFO] test label counts:")
+    print(pd.Series(labels_all[test_indices]).value_counts())
 
     train_loader = make_loader(
         dataset,
@@ -381,7 +472,9 @@ def train_one_fold(
     y_train = labels_all[train_indices]
     n_pos = int((y_train == 1).sum())
     n_neg = int((y_train == 0).sum())
-    pos_weight_value = float(n_neg / max(n_pos, 1))
+
+    raw_pos_weight = float(n_neg / max(n_pos, 1))
+    pos_weight_value = min(raw_pos_weight, 4.0)
     pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=cfg.device)
 
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
@@ -396,6 +489,10 @@ def train_one_fold(
     best_epoch = -1
     best_state_dict = None
 
+    patience = 10
+    min_epochs = 15
+    no_improve = 0
+
     for epoch in range(1, cfg.epochs + 1):
         train_loss = train_one_epoch(
             model=model,
@@ -405,69 +502,114 @@ def train_one_fold(
             criterion=criterion,
         )
 
-        val_res = evaluate_epoch(
+        val_res_05 = evaluate_epoch(
             model=model,
             loader=val_loader,
             device=cfg.device,
             criterion=criterion,
+            thr=0.5,
         )
-        val_metrics = val_res["metrics"]
+        val_metrics_05 = val_res_05["metrics"]
 
         row = {
             "epoch": epoch,
             "train_loss": train_loss,
-            "val_loss": val_metrics["loss"],
-            "val_auc": val_metrics["AUC"],
-            "val_pr_auc": val_metrics["PR_AUC"],
-            "val_f1": val_metrics["F1"],
-            "val_acc": val_metrics["ACC"],
-            "val_sen": val_metrics["SEN"],
-            "val_spe": val_metrics["SPE"],
+            "val_loss": val_metrics_05["loss"],
+            "val_auc": val_metrics_05["AUC"],
+            "val_pr_auc": val_metrics_05["PR_AUC"],
+            "val_f1_thr_05": val_metrics_05["F1"],
+            "val_acc_thr_05": val_metrics_05["ACC"],
+            "val_sen_thr_05": val_metrics_05["SEN"],
+            "val_spe_thr_05": val_metrics_05["SPE"],
         }
         history_rows.append(row)
 
-        current_val_auc = val_metrics["AUC"]
+        current_val_auc = float(val_metrics_05["AUC"])
+        current_val_pr_auc = float(val_metrics_05["PR_AUC"])
+
         if np.isnan(current_val_auc):
             current_val_auc = -1.0
+        if np.isnan(current_val_pr_auc):
+            current_val_pr_auc = -1.0
 
-        if current_val_auc > best_val_auc:
-            best_val_auc = float(current_val_auc)
+        current_val_score = 0.35 * current_val_auc + 0.65 * current_val_pr_auc
+
+        if current_val_score > best_val_auc:
+            best_val_auc = float(current_val_score)
             best_epoch = epoch
             best_state_dict = {
                 k: v.detach().cpu().clone()
                 for k, v in model.state_dict().items()
             }
+            no_improve = 0
+        else:
+            no_improve += 1
 
         print(
-            f"[fold {fold_id}] epoch {epoch:03d} | "
+            f"[single] epoch {epoch:03d} | "
             f"train_loss={train_loss:.4f} | "
-            f"val_auc={val_metrics['AUC']:.4f} | "
-            f"val_f1={val_metrics['F1']:.4f}"
+            f"val_auc={val_metrics_05['AUC']:.4f} | "
+            f"val_pr_auc={val_metrics_05['PR_AUC']:.4f} | "
+            f"val_f1@0.5={val_metrics_05['F1']:.4f}"
         )
 
+        if epoch >= min_epochs and no_improve >= patience:
+            print(f"[EARLY STOP] no improvement in val_loss for {patience} epochs, stop at epoch {epoch}")
+            break
+
+
     if best_state_dict is None:
-        raise RuntimeError(f"fold {fold_id} 没有成功保存 best_state_dict")
+        raise RuntimeError("没有成功保存 best_state_dict")
 
-    # 保存 history
     history_df = pd.DataFrame(history_rows)
-    history_df.to_csv(os.path.join(fold_out_dir, "history.csv"), index=False)
+    history_df.to_csv(os.path.join(cfg.out_dir, "history.csv"), index=False)
 
-    # 加载最佳模型
     model.load_state_dict(best_state_dict)
 
-    # 测试集评估
+    # 先在验证集上找最佳阈值
+
+    val_raw = collect_predictions(
+        model=model,
+        loader=val_loader,
+        device=cfg.device,
+        criterion=criterion,
+    )
+    best_thr = choose_best_threshold(val_raw["y_true"], val_raw["y_prob"])
+
+
+    val_res_best = build_eval_result(
+        y_true_arr=val_raw["y_true"],
+        y_prob_arr=val_raw["y_prob"],
+        subject_ids=val_raw["subject_id"],
+        loss_value=val_raw["loss"],
+        thr=best_thr,
+    )
+    val_metrics_best = val_res_best["metrics"]
+    val_pred_df = val_res_best["pred_df"]
+    val_pred_df.to_csv(os.path.join(cfg.out_dir, "predictions_val.csv"), index=False)
+    print(f"[VAL] pred_pos_rate={val_pred_df['y_pred'].mean():.4f}")
+
+
+
+
+    # 测试集用验证集选出的阈值
     test_res = evaluate_epoch(
         model=model,
         loader=test_loader,
         device=cfg.device,
         criterion=criterion,
+        thr=best_thr,
     )
     test_metrics = test_res["metrics"]
     pred_df = test_res["pred_df"]
-    pred_df["fold_id"] = fold_id
-    pred_df.to_csv(os.path.join(fold_out_dir, "predictions.csv"), index=False)
+    pred_df.to_csv(os.path.join(cfg.out_dir, "predictions_test.csv"), index=False)
+    print(f"[TEST] pred_pos_rate={pred_df['y_pred'].mean():.4f}")
+
 
     # 图
+    fig_dir = os.path.join(cfg.out_dir, "figures")
+    ensure_dir(fig_dir)
+
     y_true = pred_df["y_true"].to_numpy()
     y_prob = pred_df["y_prob"].to_numpy()
     y_pred = pred_df["y_pred"].to_numpy()
@@ -477,48 +619,36 @@ def train_one_fold(
         y_pred=y_pred,
         out_path=os.path.join(fig_dir, "confusion_matrix.png"),
     )
+
     if len(np.unique(y_true)) > 1:
         plot_roc_curve(
             y_true=y_true,
             y_prob=y_prob,
             out_path=os.path.join(fig_dir, "roc.png"),
-            title=f"Fold {fold_id} ROC",
+            title="Single Split ROC",
         )
         plot_pr_curve(
             y_true=y_true,
             y_prob=y_prob,
             out_path=os.path.join(fig_dir, "pr.png"),
-            title=f"Fold {fold_id} PR",
+            title="Single Split PR",
         )
 
-    # 保存 checkpoint
     ckpt = {
         "model_state_dict": model.state_dict(),
         "config": asdict(cfg),
-        "fold_id": fold_id,
         "scale_dim": scale_dim,
         "best_epoch": best_epoch,
         "best_val_auc": best_val_auc,
+        "best_thr": best_thr,
+        "n_train": len(train_indices),
+        "n_val": len(val_indices),
+        "n_test": len(test_indices),
+        "pos_weight": pos_weight_value,
     }
-    torch.save(ckpt, os.path.join(fold_out_dir, "model.pt"))
+    torch.save(ckpt, os.path.join(cfg.out_dir, "model.pt"))
 
-    metrics_out = dict(test_metrics)
-    metrics_out["fold_id"] = fold_id
-    metrics_out["best_epoch"] = int(best_epoch)
-    metrics_out["best_val_auc"] = float(best_val_auc)
-    save_json(metrics_out, os.path.join(fold_out_dir, "metrics.json"))
-
-    print(
-        f"[fold {fold_id}] TEST | "
-        f"AUC={test_metrics['AUC']:.4f} | "
-        f"PR_AUC={test_metrics['PR_AUC']:.4f} | "
-        f"F1={test_metrics['F1']:.4f} | "
-        f"SEN={test_metrics['SEN']:.4f} | "
-        f"SPE={test_metrics['SPE']:.4f}"
-    )
-
-    return {
-        "fold_id": fold_id,
+    metrics_out = {
         "AUC": test_metrics["AUC"],
         "PR_AUC": test_metrics["PR_AUC"],
         "F1": test_metrics["F1"],
@@ -530,55 +660,101 @@ def train_one_fold(
         "TN": test_metrics["TN"],
         "FN": test_metrics["FN"],
         "test_loss": test_metrics["loss"],
-        "best_epoch": best_epoch,
-        "best_val_auc": best_val_auc,
+        "best_epoch": int(best_epoch),
+        "best_val_auc": float(best_val_auc),
+        "best_thr": float(best_thr),
         "n_train": len(train_indices),
         "n_val": len(val_indices),
         "n_test": len(test_indices),
-        "pos_weight": pos_weight_value,
+        "pos_weight": float(pos_weight_value),
     }
+    save_json(metrics_out, os.path.join(cfg.out_dir, "metrics_test.json"))
 
+    val_metrics_out = {
+        "AUC": val_metrics_best["AUC"],
+        "PR_AUC": val_metrics_best["PR_AUC"],
+        "F1": val_metrics_best["F1"],
+        "ACC": val_metrics_best["ACC"],
+        "SEN": val_metrics_best["SEN"],
+        "SPE": val_metrics_best["SPE"],
+        "loss": val_metrics_best["loss"],
+        "best_thr": float(best_thr),
+    }
+    save_json(val_metrics_out, os.path.join(cfg.out_dir, "metrics_val.json"))
 
-def run_train(cfg: TrainConfig):
-    ensure_dir(cfg.out_dir)
-    set_seed(cfg.seed)
-
-    # 保存配置快照
-    save_json(asdict(cfg), os.path.join(cfg.out_dir, "config_snapshot.json"))
-
-    dataset, df = build_dataset_and_df(cfg)
-    fold_map = load_fold_index_map(cfg.fold_index_csv)
-    df = add_fold_column(df, fold_map)
-
-    scale_dim = infer_scale_dim(dataset)
-    all_fold_ids = sorted(df["test_fold_id"].unique().tolist())
-
-    print(f"[INFO] dataset size = {len(dataset)}")
-    print(f"[INFO] scale_dim = {scale_dim}")
-    print(f"[INFO] folds = {all_fold_ids}")
-    print(f"[INFO] device = {cfg.device}")
-
-    fold_rows = []
-    for fold_id in all_fold_ids:
-        row = train_one_fold(
-            cfg=cfg,
-            dataset=dataset,
-            df=df,
-            fold_id=int(fold_id),
-            scale_dim=scale_dim,
-        )
-        fold_rows.append(row)
-
-    fold_metrics_df = pd.DataFrame(fold_rows)
-    fold_metrics_df.to_csv(os.path.join(cfg.out_dir, "fold_metrics.csv"), index=False)
-
-    summary_df = summarize_metrics_across_folds(fold_metrics_df)
+    summary_df = pd.DataFrame(
+        [
+            {
+                "metric": "AUC",
+                "value": test_metrics["AUC"],
+            },
+            {
+                "metric": "PR_AUC",
+                "value": test_metrics["PR_AUC"],
+            },
+            {
+                "metric": "F1",
+                "value": test_metrics["F1"],
+            },
+            {
+                "metric": "ACC",
+                "value": test_metrics["ACC"],
+            },
+            {
+                "metric": "SEN",
+                "value": test_metrics["SEN"],
+            },
+            {
+                "metric": "SPE",
+                "value": test_metrics["SPE"],
+            },
+            {
+                "metric": "TP",
+                "value": test_metrics["TP"],
+            },
+            {
+                "metric": "FP",
+                "value": test_metrics["FP"],
+            },
+            {
+                "metric": "TN",
+                "value": test_metrics["TN"],
+            },
+            {
+                "metric": "FN",
+                "value": test_metrics["FN"],
+            },
+            {
+                "metric": "best_val_auc",
+                "value": best_val_auc,
+            },
+            {
+                "metric": "best_thr",
+                "value": best_thr,
+            },
+            {
+                "metric": "test_loss",
+                "value": test_metrics["loss"],
+            },
+        ]
+    )
     summary_df.to_csv(os.path.join(cfg.out_dir, "summary_metrics.csv"), index=False)
 
-    print("\n[TRAIN DONE] fold-level metrics:")
-    print(fold_metrics_df)
-    print("\n[TRAIN DONE] summary metrics:")
-    print(summary_df)
+    print("\n[TRAIN DONE] validation (using best_thr):")
+    print(pd.DataFrame([val_metrics_out]))
+
+    print("\n[TRAIN DONE] test metrics:")
+    print(pd.DataFrame([metrics_out]))
+
+    print(
+        f"\n[SINGLE TEST] "
+        f"AUC={test_metrics['AUC']:.4f} | "
+        f"PR_AUC={test_metrics['PR_AUC']:.4f} | "
+        f"F1={test_metrics['F1']:.4f} | "
+        f"SEN={test_metrics['SEN']:.4f} | "
+        f"SPE={test_metrics['SPE']:.4f} | "
+        f"best_thr={best_thr:.4f}"
+    )
 
 
 def main():
@@ -589,7 +765,7 @@ def main():
         "--yaml",
         type=str,
         required=True,
-        help="例如: configs/mm_transformer_baseline/transformer_baseline.yaml",
+        help="例如: configs/mm_transformer_baseline/transformer_baseline_single.yaml",
     )
     args = ap.parse_args()
 

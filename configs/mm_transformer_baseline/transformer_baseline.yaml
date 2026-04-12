@@ -1,26 +1,21 @@
 cohort_csv: results/week2/day1/cohort_filtered.csv
 fold_index_csv: results/week2/day1/fold_index.csv
-out_dir: results/mm_transformer_baseline/transformer_baseline
+out_dir: results/mm_transformer_baseline/transformer_baseline_v2
 
-# 调整后的配置参数，优化性能但控制显存占用
-batch_size: 8  # 增加 batch_size 为 8 以提高训练效率，同时不至于占用过多显存
-epochs: 50  # 保持 epoch 数量不变
-lr: 0.0005  # 保持较低的学习率
-weight_decay: 0.0005  # 防止过拟合
+batch_size: 16
+epochs: 50
+lr: 0.0005
+weight_decay: 0.0005
 
-embed_dim: 128  # 保持较高的嵌入维度，适当提升模型的表达能力
-num_heads: 4  # 保持多头注意力机制，适度增加表达能力
-dropout: 0.3  # 适当增加 dropout 防止过拟合
+embed_dim: 128
+num_heads: 4
+dropout: 0.3
 scale_tokens: 1
-matrix_tokens: 8  # 保持适度的矩阵 tokens 数量
-matrix_pool_width: 32  # 保持适度的池化宽度
-classifier_hidden: 128  # 保持分类器隐藏层维度
+matrix_tokens: 8
+matrix_pool_width: 32
+classifier_hidden: 128
 
-val_ratio: 0.2  # 保持验证集比例
+val_ratio: 0.2
+
 seed: 42
-num_workers: 0  # 禁用多线程加载，避免过多的并发操作
-
-# 新增 lr_scheduler 参数：使用 StepLR 学习率调度器
-lr_scheduler:
-  step_size: 10  # 每 10 个 epoch 调整一次学习率
-  gamma: 0.5  # 每次调整时，学习率减少 50%
+num_workers: 0

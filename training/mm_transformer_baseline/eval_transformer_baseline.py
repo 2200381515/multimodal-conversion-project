@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import os
 import json
-import random
-from dataclasses import dataclass, asdict
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -12,12 +10,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from sklearn.metrics import average_precision_score
-from sklearn.model_selection import train_test_split
-
-try:
-    import yaml  # type: ignore
-except Exception:
-    yaml = None
 
 from pipeline.dataset import PatientT0Dataset
 from baselines.metrics import binary_metrics
@@ -27,59 +19,12 @@ from models.mm_transformer_baseline.multimodal_transformer import (
 from training.common.visualize import (
     ensure_dir,
     plot_confusion_binary,
-    plot_roc_curve,
     plot_pr_curve,
+    plot_roc_curve,
 )
 
 
-@dataclass
-class TrainConfig:
-    cohort_csv: str
-    fold_index_csv: str
-    out_dir: str
-
-    batch_size: int = 8
-    epochs: int = 30
-    lr: float = 1e-3
-    weight_decay: float = 1e-4
-
-    embed_dim: int = 128
-    num_heads: int = 4
-    dropout: float = 0.1
-    scale_tokens: int = 1
-    matrix_tokens: int = 8
-    matrix_pool_width: int = 32
-    classifier_hidden: int = 128
-
-    val_ratio: float = 0.2
-    seed: int = 42
-    num_workers: int = 0
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-def set_seed(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    # 为了结果更稳定
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def load_config_from_yaml(yaml_path: str) -> TrainConfig:
-    if yaml is None:
-        raise RuntimeError("未安装 pyyaml，请先执行: pip install pyyaml")
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        cfg_dict = yaml.safe_load(f)
-    return TrainConfig(**cfg_dict)
-
-
 def load_fold_index_map(fold_index_csv: str) -> Dict[str, int]:
-    """
-    fold_index.csv 由 baselines/day1_prepare.py 生成，
-    包含: subject_id, label_convert, test_fold_id
-    """
     df = pd.read_csv(fold_index_csv)
     if "subject_id" not in df.columns or "test_fold_id" not in df.columns:
         raise ValueError(
@@ -88,19 +33,18 @@ def load_fold_index_map(fold_index_csv: str) -> Dict[str, int]:
     return dict(zip(df["subject_id"].astype(str), df["test_fold_id"].astype(int)))
 
 
-def build_dataset_and_df(cfg: TrainConfig) -> Tuple[PatientT0Dataset, pd.DataFrame]:
+def build_dataset(cohort_csv: str) -> PatientT0Dataset:
     ds = PatientT0Dataset(
-        cohort_csv=cfg.cohort_csv,
-        require_eligible=False,   # cohort_filtered.csv 通常已过滤过
-        drop_qc_excluded=False,   # 同上
+        cohort_csv=cohort_csv,
+        require_eligible=False,
+        drop_qc_excluded=False,
         fill_missing=True,
         sc_norm="zscore_global",
         fc_norm="zscore_global",
         scale_norm_stats=None,
         drop_scale_cols=["DATASET-DIAG2"],
     )
-    df = ds.df.copy().reset_index(drop=True)
-    return ds, df
+    return ds
 
 
 def add_fold_column(df: pd.DataFrame, fold_map: Dict[str, int]) -> pd.DataFrame:
@@ -114,57 +58,6 @@ def add_fold_column(df: pd.DataFrame, fold_map: Dict[str, int]) -> pd.DataFrame:
     return df
 
 
-def split_train_val_indices(
-    train_indices: List[int],
-    labels: np.ndarray,
-    val_ratio: float,
-    seed: int,
-) -> Tuple[List[int], List[int]]:
-    """
-    在 train fold 内再切一个 val。
-    如果标签太极端导致 stratify 失败，则退化为随机切分。
-    """
-    if len(train_indices) < 2:
-        return train_indices, []
-
-    y_train = labels[train_indices]
-    idx_arr = np.array(train_indices)
-
-    try:
-        tr_idx, va_idx = train_test_split(
-            idx_arr,
-            test_size=val_ratio,
-            random_state=seed,
-            stratify=y_train,
-        )
-    except Exception:
-        tr_idx, va_idx = train_test_split(
-            idx_arr,
-            test_size=val_ratio,
-            random_state=seed,
-            shuffle=True,
-        )
-
-    return tr_idx.tolist(), va_idx.tolist()
-
-
-def make_loader(
-    dataset,
-    indices: List[int],
-    batch_size: int,
-    shuffle: bool,
-    num_workers: int,
-) -> DataLoader:
-    subset = Subset(dataset, indices)
-    return DataLoader(
-        subset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-    )
-
-
 def infer_scale_dim(dataset: PatientT0Dataset) -> int:
     sample = dataset[0]
     x_scale = sample["x_scale"]
@@ -173,18 +66,20 @@ def infer_scale_dim(dataset: PatientT0Dataset) -> int:
     return int(x_scale.numel())
 
 
-def build_model(cfg: TrainConfig, scale_dim: int) -> MultimodalTransformerBaseline:
-    model = MultimodalTransformerBaseline(
-        scale_dim=scale_dim,
-        embed_dim=cfg.embed_dim,
-        num_heads=cfg.num_heads,
-        dropout=cfg.dropout,
-        scale_tokens=cfg.scale_tokens,
-        matrix_tokens=cfg.matrix_tokens,
-        matrix_pool_width=cfg.matrix_pool_width,
-        classifier_hidden=cfg.classifier_hidden,
+def make_loader(
+    dataset,
+    indices: List[int],
+    batch_size: int,
+    num_workers: int,
+) -> DataLoader:
+    subset = Subset(dataset, indices)
+    return DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
     )
-    return model
 
 
 def move_batch_to_device(batch: Dict, device: str) -> Dict:
@@ -197,19 +92,33 @@ def move_batch_to_device(batch: Dict, device: str) -> Dict:
     return out
 
 
+def build_model_from_ckpt(ckpt: Dict, device: str) -> MultimodalTransformerBaseline:
+    cfg = ckpt["config"]
+    model = MultimodalTransformerBaseline(
+        scale_dim=int(ckpt["scale_dim"]),
+        embed_dim=int(cfg["embed_dim"]),
+        num_heads=int(cfg["num_heads"]),
+        dropout=float(cfg["dropout"]),
+        scale_tokens=int(cfg["scale_tokens"]),
+        matrix_tokens=int(cfg["matrix_tokens"]),
+        matrix_pool_width=int(cfg["matrix_pool_width"]),
+        classifier_hidden=int(cfg["classifier_hidden"]),
+    )
+    model.load_state_dict(ckpt["model_state_dict"])
+    model = model.to(device)
+    model.eval()
+    return model
+
+
 @torch.no_grad()
-def evaluate_epoch(
+def evaluate_model(
     model: nn.Module,
     loader: DataLoader,
     device: str,
-    criterion: nn.Module,
 ) -> Dict:
-    model.eval()
-
-    losses = []
     y_true_all = []
     y_prob_all = []
-    meta_subjects = []
+    subject_ids = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -220,40 +129,32 @@ def evaluate_epoch(
             x_fc=batch["x_fc"].float(),
             modality_mask=batch["modality_mask"].float(),
         )
-        logits = out["logits"]
-        y = batch["y"].float()
 
-        loss = criterion(logits, y)
-        losses.append(float(loss.item()))
-
-        y_prob = torch.sigmoid(logits).detach().cpu().numpy()
-        y_true = y.detach().cpu().numpy()
+        y_prob = out["prob"].detach().cpu().numpy()
+        y_true = batch["y"].detach().cpu().numpy().astype(int)
 
         y_prob_all.extend(y_prob.tolist())
-        y_true_all.extend(y_true.astype(int).tolist())
+        y_true_all.extend(y_true.tolist())
 
         metas = batch["meta"]
         if isinstance(metas, dict) and "subject_id" in metas:
-            meta_subjects.extend([str(s) for s in metas["subject_id"]])
+            subject_ids.extend([str(s) for s in metas["subject_id"]])
         else:
-            meta_subjects.extend(["unknown"] * len(y_true))
+            subject_ids.extend(["unknown"] * len(y_true))
 
     y_true_arr = np.asarray(y_true_all).astype(int)
     y_prob_arr = np.asarray(y_prob_all).astype(float)
     y_pred_arr = (y_prob_arr >= 0.5).astype(int)
 
-    m = binary_metrics(y_true_arr, y_prob_arr, thr=0.5)
+    metrics = binary_metrics(y_true_arr, y_prob_arr, thr=0.5)
     if len(np.unique(y_true_arr)) > 1:
-        pr_auc = float(average_precision_score(y_true_arr, y_prob_arr))
+        metrics["PR_AUC"] = float(average_precision_score(y_true_arr, y_prob_arr))
     else:
-        pr_auc = float("nan")
-
-    m["PR_AUC"] = pr_auc
-    m["loss"] = float(np.mean(losses)) if losses else float("nan")
+        metrics["PR_AUC"] = float("nan")
 
     pred_df = pd.DataFrame(
         {
-            "subject_id": meta_subjects,
+            "subject_id": subject_ids,
             "y_true": y_true_arr,
             "y_prob": y_prob_arr,
             "y_pred": y_pred_arr,
@@ -261,42 +162,9 @@ def evaluate_epoch(
     )
 
     return {
-        "metrics": m,
+        "metrics": metrics,
         "pred_df": pred_df,
     }
-
-
-def train_one_epoch(
-    model: nn.Module,
-    loader: DataLoader,
-    device: str,
-    optimizer: torch.optim.Optimizer,
-    criterion: nn.Module,
-) -> float:
-    model.train()
-    losses = []
-
-    for batch in loader:
-        batch = move_batch_to_device(batch, device)
-
-        optimizer.zero_grad()
-
-        out = model(
-            x_scale=batch["x_scale"].float(),
-            x_sc=batch["x_sc"].float(),
-            x_fc=batch["x_fc"].float(),
-            modality_mask=batch["modality_mask"].float(),
-        )
-        logits = out["logits"]
-        y = batch["y"].float()
-
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
-
-        losses.append(float(loss.item()))
-
-    return float(np.mean(losses)) if losses else float("nan")
 
 
 def save_json(obj: Dict, path: str):
@@ -309,7 +177,7 @@ def summarize_metrics_across_folds(fold_metrics: pd.DataFrame) -> pd.DataFrame:
         "AUC", "PR_AUC", "F1", "ACC", "SEN", "SPE",
         "TP", "FP", "TN", "FN",
         "best_val_auc",
-        "test_loss",
+        "best_epoch",
     ]
     rows = []
     for c in metric_cols:
@@ -328,226 +196,21 @@ def summarize_metrics_across_folds(fold_metrics: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def train_one_fold(
-    cfg: TrainConfig,
-    dataset: PatientT0Dataset,
-    df: pd.DataFrame,
-    fold_id: int,
-    scale_dim: int,
-) -> Dict:
-    fold_out_dir = os.path.join(cfg.out_dir, f"fold_{fold_id}")
-    fig_dir = os.path.join(fold_out_dir, "figures")
-    ensure_dir(fold_out_dir)
-    ensure_dir(fig_dir)
+def run_eval(
+    cohort_csv: str,
+    fold_index_csv: str,
+    ckpt_dir: str,
+    out_dir: str,
+    batch_size: int = 8,
+    num_workers: int = 0,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+):
+    ensure_dir(out_dir)
 
-    test_indices = df.index[df["test_fold_id"] == fold_id].tolist()
-    trainval_indices = df.index[df["test_fold_id"] != fold_id].tolist()
+    dataset = build_dataset(cohort_csv)
+    df = dataset.df.copy().reset_index(drop=True)
 
-    labels_all = df["label_convert"].astype(int).to_numpy()
-    train_indices, val_indices = split_train_val_indices(
-        train_indices=trainval_indices,
-        labels=labels_all,
-        val_ratio=cfg.val_ratio,
-        seed=cfg.seed + fold_id,
-    )
-
-    if len(val_indices) == 0:
-        raise RuntimeError(f"fold {fold_id} 的 val 集为空，请检查数据量或 val_ratio。")
-
-    train_loader = make_loader(
-        dataset,
-        train_indices,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-    )
-    val_loader = make_loader(
-        dataset,
-        val_indices,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-    )
-    test_loader = make_loader(
-        dataset,
-        test_indices,
-        batch_size=cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-    )
-
-    model = build_model(cfg, scale_dim).to(cfg.device)
-
-    y_train = labels_all[train_indices]
-    n_pos = int((y_train == 1).sum())
-    n_neg = int((y_train == 0).sum())
-    pos_weight_value = float(n_neg / max(n_pos, 1))
-    pos_weight = torch.tensor([pos_weight_value], dtype=torch.float32, device=cfg.device)
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg.lr,
-        weight_decay=cfg.weight_decay,
-    )
-
-    history_rows = []
-    best_val_auc = -1.0
-    best_epoch = -1
-    best_state_dict = None
-
-    for epoch in range(1, cfg.epochs + 1):
-        train_loss = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            device=cfg.device,
-            optimizer=optimizer,
-            criterion=criterion,
-        )
-
-        val_res = evaluate_epoch(
-            model=model,
-            loader=val_loader,
-            device=cfg.device,
-            criterion=criterion,
-        )
-        val_metrics = val_res["metrics"]
-
-        row = {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "val_loss": val_metrics["loss"],
-            "val_auc": val_metrics["AUC"],
-            "val_pr_auc": val_metrics["PR_AUC"],
-            "val_f1": val_metrics["F1"],
-            "val_acc": val_metrics["ACC"],
-            "val_sen": val_metrics["SEN"],
-            "val_spe": val_metrics["SPE"],
-        }
-        history_rows.append(row)
-
-        current_val_auc = val_metrics["AUC"]
-        if np.isnan(current_val_auc):
-            current_val_auc = -1.0
-
-        if current_val_auc > best_val_auc:
-            best_val_auc = float(current_val_auc)
-            best_epoch = epoch
-            best_state_dict = {
-                k: v.detach().cpu().clone()
-                for k, v in model.state_dict().items()
-            }
-
-        print(
-            f"[fold {fold_id}] epoch {epoch:03d} | "
-            f"train_loss={train_loss:.4f} | "
-            f"val_auc={val_metrics['AUC']:.4f} | "
-            f"val_f1={val_metrics['F1']:.4f}"
-        )
-
-    if best_state_dict is None:
-        raise RuntimeError(f"fold {fold_id} 没有成功保存 best_state_dict")
-
-    # 保存 history
-    history_df = pd.DataFrame(history_rows)
-    history_df.to_csv(os.path.join(fold_out_dir, "history.csv"), index=False)
-
-    # 加载最佳模型
-    model.load_state_dict(best_state_dict)
-
-    # 测试集评估
-    test_res = evaluate_epoch(
-        model=model,
-        loader=test_loader,
-        device=cfg.device,
-        criterion=criterion,
-    )
-    test_metrics = test_res["metrics"]
-    pred_df = test_res["pred_df"]
-    pred_df["fold_id"] = fold_id
-    pred_df.to_csv(os.path.join(fold_out_dir, "predictions.csv"), index=False)
-
-    # 图
-    y_true = pred_df["y_true"].to_numpy()
-    y_prob = pred_df["y_prob"].to_numpy()
-    y_pred = pred_df["y_pred"].to_numpy()
-
-    plot_confusion_binary(
-        y_true=y_true,
-        y_pred=y_pred,
-        out_path=os.path.join(fig_dir, "confusion_matrix.png"),
-    )
-    if len(np.unique(y_true)) > 1:
-        plot_roc_curve(
-            y_true=y_true,
-            y_prob=y_prob,
-            out_path=os.path.join(fig_dir, "roc.png"),
-            title=f"Fold {fold_id} ROC",
-        )
-        plot_pr_curve(
-            y_true=y_true,
-            y_prob=y_prob,
-            out_path=os.path.join(fig_dir, "pr.png"),
-            title=f"Fold {fold_id} PR",
-        )
-
-    # 保存 checkpoint
-    ckpt = {
-        "model_state_dict": model.state_dict(),
-        "config": asdict(cfg),
-        "fold_id": fold_id,
-        "scale_dim": scale_dim,
-        "best_epoch": best_epoch,
-        "best_val_auc": best_val_auc,
-    }
-    torch.save(ckpt, os.path.join(fold_out_dir, "model.pt"))
-
-    metrics_out = dict(test_metrics)
-    metrics_out["fold_id"] = fold_id
-    metrics_out["best_epoch"] = int(best_epoch)
-    metrics_out["best_val_auc"] = float(best_val_auc)
-    save_json(metrics_out, os.path.join(fold_out_dir, "metrics.json"))
-
-    print(
-        f"[fold {fold_id}] TEST | "
-        f"AUC={test_metrics['AUC']:.4f} | "
-        f"PR_AUC={test_metrics['PR_AUC']:.4f} | "
-        f"F1={test_metrics['F1']:.4f} | "
-        f"SEN={test_metrics['SEN']:.4f} | "
-        f"SPE={test_metrics['SPE']:.4f}"
-    )
-
-    return {
-        "fold_id": fold_id,
-        "AUC": test_metrics["AUC"],
-        "PR_AUC": test_metrics["PR_AUC"],
-        "F1": test_metrics["F1"],
-        "ACC": test_metrics["ACC"],
-        "SEN": test_metrics["SEN"],
-        "SPE": test_metrics["SPE"],
-        "TP": test_metrics["TP"],
-        "FP": test_metrics["FP"],
-        "TN": test_metrics["TN"],
-        "FN": test_metrics["FN"],
-        "test_loss": test_metrics["loss"],
-        "best_epoch": best_epoch,
-        "best_val_auc": best_val_auc,
-        "n_train": len(train_indices),
-        "n_val": len(val_indices),
-        "n_test": len(test_indices),
-        "pos_weight": pos_weight_value,
-    }
-
-
-def run_train(cfg: TrainConfig):
-    ensure_dir(cfg.out_dir)
-    set_seed(cfg.seed)
-
-    # 保存配置快照
-    save_json(asdict(cfg), os.path.join(cfg.out_dir, "config_snapshot.json"))
-
-    dataset, df = build_dataset_and_df(cfg)
-    fold_map = load_fold_index_map(cfg.fold_index_csv)
+    fold_map = load_fold_index_map(fold_index_csv)
     df = add_fold_column(df, fold_map)
 
     scale_dim = infer_scale_dim(dataset)
@@ -556,28 +219,93 @@ def run_train(cfg: TrainConfig):
     print(f"[INFO] dataset size = {len(dataset)}")
     print(f"[INFO] scale_dim = {scale_dim}")
     print(f"[INFO] folds = {all_fold_ids}")
-    print(f"[INFO] device = {cfg.device}")
+    print(f"[INFO] device = {device}")
 
     fold_rows = []
+
     for fold_id in all_fold_ids:
-        row = train_one_fold(
-            cfg=cfg,
+        fold_ckpt_path = os.path.join(ckpt_dir, f"fold_{fold_id}", "model.pt")
+        if not os.path.exists(fold_ckpt_path):
+            print(f"[WARN] fold {fold_id} 缺少 checkpoint，跳过: {fold_ckpt_path}")
+            continue
+
+        fold_out_dir = os.path.join(out_dir, f"fold_{fold_id}")
+        fig_dir = os.path.join(fold_out_dir, "figures")
+        ensure_dir(fold_out_dir)
+        ensure_dir(fig_dir)
+
+        test_indices = df.index[df["test_fold_id"] == fold_id].tolist()
+        test_loader = make_loader(
             dataset=dataset,
-            df=df,
-            fold_id=int(fold_id),
-            scale_dim=scale_dim,
+            indices=test_indices,
+            batch_size=batch_size,
+            num_workers=num_workers,
         )
-        fold_rows.append(row)
+
+        ckpt = torch.load(fold_ckpt_path, map_location=device)
+        model = build_model_from_ckpt(ckpt, device=device)
+
+        res = evaluate_model(model=model, loader=test_loader, device=device)
+        metrics = res["metrics"]
+        pred_df = res["pred_df"]
+        pred_df["fold_id"] = fold_id
+
+        pred_path = os.path.join(fold_out_dir, "predictions.csv")
+        pred_df.to_csv(pred_path, index=False)
+
+        y_true = pred_df["y_true"].to_numpy()
+        y_prob = pred_df["y_prob"].to_numpy()
+        y_pred = pred_df["y_pred"].to_numpy()
+
+        plot_confusion_binary(
+            y_true=y_true,
+            y_pred=y_pred,
+            out_path=os.path.join(fig_dir, "confusion_matrix.png"),
+        )
+        if len(np.unique(y_true)) > 1:
+            plot_roc_curve(
+                y_true=y_true,
+                y_prob=y_prob,
+                out_path=os.path.join(fig_dir, "roc.png"),
+                title=f"Fold {fold_id} ROC",
+            )
+            plot_pr_curve(
+                y_true=y_true,
+                y_prob=y_prob,
+                out_path=os.path.join(fig_dir, "pr.png"),
+                title=f"Fold {fold_id} PR",
+            )
+
+        fold_metrics = dict(metrics)
+        fold_metrics["fold_id"] = int(fold_id)
+        fold_metrics["best_epoch"] = int(ckpt.get("best_epoch", -1))
+        fold_metrics["best_val_auc"] = float(ckpt.get("best_val_auc", float("nan")))
+
+        save_json(fold_metrics, os.path.join(fold_out_dir, "metrics.json"))
+
+        print(
+            f"[fold {fold_id}] "
+            f"AUC={metrics['AUC']:.4f} | "
+            f"PR_AUC={metrics['PR_AUC']:.4f} | "
+            f"F1={metrics['F1']:.4f} | "
+            f"SEN={metrics['SEN']:.4f} | "
+            f"SPE={metrics['SPE']:.4f}"
+        )
+
+        fold_rows.append(fold_metrics)
+
+    if not fold_rows:
+        raise RuntimeError("没有成功评估任何 fold，请检查 ckpt_dir 是否正确。")
 
     fold_metrics_df = pd.DataFrame(fold_rows)
-    fold_metrics_df.to_csv(os.path.join(cfg.out_dir, "fold_metrics.csv"), index=False)
+    fold_metrics_df.to_csv(os.path.join(out_dir, "fold_metrics.csv"), index=False)
 
     summary_df = summarize_metrics_across_folds(fold_metrics_df)
-    summary_df.to_csv(os.path.join(cfg.out_dir, "summary_metrics.csv"), index=False)
+    summary_df.to_csv(os.path.join(out_dir, "summary_metrics.csv"), index=False)
 
-    print("\n[TRAIN DONE] fold-level metrics:")
+    print("\n[EVAL DONE] fold-level metrics:")
     print(fold_metrics_df)
-    print("\n[TRAIN DONE] summary metrics:")
+    print("\n[EVAL DONE] summary metrics:")
     print(summary_df)
 
 
@@ -585,16 +313,28 @@ def main():
     import argparse
 
     ap = argparse.ArgumentParser()
+    ap.add_argument("--cohort_csv", type=str, required=True)
+    ap.add_argument("--fold_index_csv", type=str, required=True)
+    ap.add_argument("--ckpt_dir", type=str, required=True)
+    ap.add_argument("--out_dir", type=str, required=True)
+    ap.add_argument("--batch_size", type=int, default=8)
+    ap.add_argument("--num_workers", type=int, default=0)
     ap.add_argument(
-        "--yaml",
+        "--device",
         type=str,
-        required=True,
-        help="例如: configs/mm_transformer_baseline/transformer_baseline.yaml",
+        default="cuda" if torch.cuda.is_available() else "cpu",
     )
     args = ap.parse_args()
 
-    cfg = load_config_from_yaml(args.yaml)
-    run_train(cfg)
+    run_eval(
+        cohort_csv=args.cohort_csv,
+        fold_index_csv=args.fold_index_csv,
+        ckpt_dir=args.ckpt_dir,
+        out_dir=args.out_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        device=args.device,
+    )
 
 
 if __name__ == "__main__":

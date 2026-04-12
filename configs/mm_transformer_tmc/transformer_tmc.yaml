@@ -1,0 +1,40 @@
+data:
+  cohort_csv: results/week2/day1/cohort_filtered.csv
+  fold_index_csv: results/week2/day1/fold_index.csv
+
+model:
+  scale_dim: 32
+
+  backbone_kwargs:
+    scale_dim: 32
+    embed_dim: 128
+    num_heads: 4
+    dropout: 0.1
+    scale_tokens: 1
+    matrix_tokens: 8
+    matrix_pool_width: 32
+    classifier_hidden: 128
+
+  evidence_hidden_dim: 128
+  evidence_dropout: 0.1
+  use_fused_feature_view: false
+
+train:
+  seed: 42
+  device: cpu
+  out_dir: results/mm_transformer_tmc/transformer_tmc
+
+  batch_size: 8
+  epochs: 30
+  lr: 0.0003
+  weight_decay: 0.0001
+  val_ratio: 0.2
+  grad_clip: 5.0
+  num_workers: 0
+
+  pos_weight_mode: dynamic_cap
+  pos_weight: 6.0
+  pos_weight_cap: 6.0
+
+  lambda_view: 0.3
+  lambda_evidence: 0.0001

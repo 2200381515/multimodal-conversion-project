@@ -1,0 +1,21 @@
+cohort_csv: results/week2/day1/cohort_filtered.csv
+split_csv: results/week2/day1/single_split.csv
+out_dir: results/mm_transformer_baseline/single_split_v1
+
+batch_size: 8
+epochs: 25
+lr: 0.0003
+weight_decay: 0.0005
+
+embed_dim: 64
+num_heads: 2
+dropout: 0.3
+scale_tokens: 1
+matrix_tokens: 8
+matrix_pool_width: 32
+classifier_hidden: 64
+
+val_ratio: 0.2
+seed: 42
+num_workers: 0
+device: cpu
